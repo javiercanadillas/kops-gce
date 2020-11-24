@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+
+# Script-wide settings and checks
+set -CeE 
+set -o pipefail
+if [[ "${BASH_VERSINFO:-0}" -lt 4 ]]; then
+  cat <<-EOF >&2
+    WARNING: this bash ${BASH_VERSION} does not support several modern safety features.
+    This script was written and tested with modern shell standards, it may not perform
+    well in this environment.
+EOF
+  sleep 1
+else
+  set -u
+fi
+
+### Script-wide variables ###
+readonly PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
+readonly WORK_DIR="${WORK_DIR:-"${PWD}/workdir"}"
+readonly BIN_DIR="${WORK_DIR}/bin"
+readonly REMOTE_CLUSTER_NAME_BASE="${GCE_CONTEXT:="onprem"}"
+readonly REMOTE_CLUSTER_NAME="${REMOTE_CLUSTER_NAME_BASE}.k8s.local"
+readonly KOPS_STORE=gs://"${PROJECT_ID}-kops-${REMOTE_CLUSTER_NAME_BASE}"
+readonly REMOTE_KUBECONFIG="${WORK_DIR}/${REMOTE_CLUSTER_NAME_BASE}.context"
+readonly ZONE="${ZONE:-"$(gcloud config get-value compute/zone 2>/dev/null)"}"
+readonly SCRIPT_NAME="${0##*/}"
+SKIP_CREDENTIALS="${SKIP_CREDENTIALS:-"0"}"
+CURRENT_COMMAND=
+PLATFORM="${WORK_DIR:-"linux"}" # Default platform is Linux, but we'll detect it anyway
+COMMANDS=() # Storage of commands
+
+
+### Convenience functions ###
+warn() {
+  info "${1}" >&2
+}
+
+info() {
+  echo "${SCRIPT_NAME} ${CURRENT_COMMAND}: ${1}"
+}
+
+fatal() {
+  warn "ERROR: ${1}"
+  exit 2
+}
+
+fatal_with_usage() {
+  warn "${1}"
+  usage >&2
+  exit 2
+}
+
+detect_platform() {
+  case "$OSTYPE" in
+    darwin*) 
+      PLATFORM="mac"
+      ;;
+    linux*)
+      if [[ $CLOUD_SHELL ]]; then
+        PLATFORM="cloudshell"
+      else
+        PLATFORM="linux"
+      fi  
+      ;;
+    *)
+      fatal "Unknown or not supported platform ${OSTYPE}"
+      ;;
+  esac
+}
+
+### Program specific functions ###
+kops::main_install() {
+  detect_platform
+	info "Installing KOPS cluster in project ${PROJECT_ID}, zone ${ZONE}"
+  get_app_default_creds
+	create_bucket
+	setup_binaries_loc
+	install_kops
+	create_kops_cluster
+	up_check
+  authorize_user
+  rename_context "${REMOTE_CLUSTER_NAME}" "${GCE_CONTEXT}"
+}
+
+kops::main_destroy() {
+	info "Deleting kops cluster and cleaning up..."
+  #info "Unregistering kops cluster from Hub"
+	#gcloud container hub memberships unregister "${REMOTE_CLUSTER_NAME_BASE}" \
+  # --project="${PROJECT_ID}" \
+  # --context="${REMOTE_CLUSTER_NAME}" \
+  # --kubeconfig="${REMOTE_KUBECONFIG}" 2>/dev/null || echo "Cluster was not registered in Hub. Skipping."; true
+  check_kops_binary #TODO
+  info "Deleting onprem Kops cluster..."
+  "${BIN_DIR}"/kops delete cluster --name "${REMOTE_CLUSTER_NAME}" --state "${KOPS_STORE}" --yes
+  info "Deleting Kops store in GCS..."
+  gsutil -m rm -r "${KOPS_STORE}"
+  info "Cleaning up workdir..."
+  rm -rf "${WORK_DIR}"
+}
+
+get_app_default_creds() {
+  if [[ SKIP_CREDENTIALS -ne 1 ]]; then
+    info "Setting up credentials...follow instructions inf the screen and authenticate with the right identity"
+    gcloud auth application-default login --no-launch-browser
+  fi
+}
+
+create_bucket() {
+	info "Creating KOPS bucket ${KOPS_STORE}..."
+  gsutil mb "${KOPS_STORE}" 2>/dev/null || info "Bucket ${KOPS_STORE} already present."; true
+}
+
+setup_binaries_loc() {
+	info "Setting up ${BIN_DIR} for storing binaries..."
+	mkdir -p "${BIN_DIR}"
+}
+
+check_kops_binary() {
+  if [[ ! -f  "${BIN_DIR}/kops" ]]; then
+    info "Kops binary is not present in ${BIN_DIR}. Reinstalling...."
+    install_kops
+  fi
+}
+
+install_kops() {
+	info "Installing kops tool for your current platform..."
+  local KOPS_FILE
+  local -r KOPS_API_URL="https://api.github.com/repos/kubernetes/kops/releases/latest"
+  local -r KOPS_DW_URL="https://github.com/kubernetes/kops/releases/download"
+  local -r KOPS_VERSION="$(curl -s ${KOPS_API_URL} | grep tag_name | cut -d '"' -f 4)"
+	case "${PLATFORM}" in
+    linux)
+      KOPS_FILE="kops-linux-amd64"
+      ;;
+    mac)
+      KOPS_FILE="kops-darwin-amd64"
+      ;;
+    *)
+      fatal "Unknown platform ${OSTYPE}"
+      ;;
+  esac
+  curl -Lo kops "${KOPS_DW_URL}/${KOPS_VERSION}/${KOPS_FILE}"
+  chmod +x kops
+  mv kops "${BIN_DIR}"
+  echo "Moved kops tool to ${BIN_DIR}"
+}
+
+create_kops_cluster() {
+	info "Creating kops cluster named \"${REMOTE_CLUSTER_NAME}\"..."
+  # shellcheck disable=SC2034
+  # Variable must be exported for kops to actually create the cluster
+  export KOPS_FEATURE_FLAGS='AlphaAllowGCE'
+  local NODE_COUNT="${NODE_COUNT:=4}"
+  local NODE_SIZE="${NODE_SIZE:="n1-standard-4"}"
+	"${BIN_DIR}"/kops create cluster \
+		--name="${REMOTE_CLUSTER_NAME}" \
+		--zones="${ZONE}" \
+		--state="${KOPS_STORE}" \
+		--project="${PROJECT_ID}" \
+		--node-count="${NODE_COUNT}" \
+		--node-size="${NODE_SIZE}" \
+		--api-loadbalancer-type="public" \
+		--yes
+	# TODO: Check this, unsure about kops create updating the kubectl command config with a new context
+  # If context is not updated, see https://gist.github.com/jeffjohnson9046/295e7a032b9a910b0f9896e1c432e972
+	if [[ -e "${REMOTE_KUBECONFIG}" ]]; then
+    mv "${REMOTE_KUBECONFIG}" "${REMOTE_KUBECONFIG}.old"
+  fi
+  kubectl config view --minify --flatten --context="${REMOTE_CLUSTER_NAME}" > "${REMOTE_KUBECONFIG}"
+  unset KOPS_FEATURE_FLAGS
+}
+
+up_check() {
+  info "Checking cluster readiness, go grab a quick coffee or spin up a couple of GKE clusters while waiting..."
+  "${BIN_DIR}"/kops validate cluster --name "${REMOTE_CLUSTER_NAME}" --state "${KOPS_STORE}" --wait 10m
+}
+
+rename_context() {
+  local -r OLD_CTX_NAME="${1}"
+  local -r NEW_CTX_NAME="${2}"
+  kubectx "${NEW_CTX_NAME}"="${OLD_CTX_NAME}" && kubectx "${NEW_CTX_NAME}"
+}
+
+authorize_user() {
+  local GCLOUD_USER="$(gcloud config get-value account)"
+  # Ensure you have cluster-admin on the remote cluster
+  kubectl create clusterrolebinding user-cluster-admin --clusterrole cluster-admin --user "${GCLOUD_USER}"
+}
+
+### CLI functions ###
+usage() {
+  cat << EOF
+usage: ${SCRIPT_NAME} [COMMANDS] [OPTIONS] [FLAGS]...
+
+Creates a kops cluster in Google Cloud Compute Engine.
+
+COMMANDS:
+  install                     Creates a kops cluster
+  destroy                     destroys a kops cluster
+
+OPTIONS:
+  -c | --cluster-name         Specify a cluster name
+  -z | --zone                 Specify a compute zone
+  -p | --project-id           Specify a project ID
+
+FLAGS:
+  -sc | --skip-credentials    Destroys kops cluster and associated
+                              configurations.
+  -h | --help                 Show this message and exit
+
+EXAMPLE:
+This example will create a new kops cluster, assuming application default credentials are already set up:
+  $> ${SCRIPT_NAME} install --skip-credentials
+EOF
+}
+
+arg_required() {
+  if [[ ! "${2:-}" || "${2:0:1}" = '-' ]]; then
+    fatal "Option ${1} requires an argument."
+  fi
+}
+
+kops::parse_command() {
+  # shellcheck disable=SC2064
+  trap "$(shopt -p nocasematch)" RETURN
+  shopt -s nocasematch
+  CURRENT_COMMAND="${1}"
+
+  case "${CURRENT_COMMAND}" in
+    install)
+      kops::main_install
+      ;;
+    destroy)
+      kops::main_destroy
+      ;;
+    *) #Catch empty or not listed command
+      if [ -z "${CURRENT_COMMAND}" ]; then
+        fatal "Error: command not supplied, try again."
+      else
+        fatal_with_usage "Error: invalid command \"${1}\""
+      fi
+      ;;
+  esac
+}
+
+kops::parse_args() {
+  # shellcheck disable=SC2064
+  trap "$(shopt -p nocasematch)" RETURN
+  shopt -s nocasematch
+
+  while [[ $# != 0 ]]; do
+    case "${1}" in
+      -c | --cluster-name | --cluster_name)
+        arg_required "${@}"
+        readonly REMOTE_CLUSTER_NAME="${2}"
+        shift 2
+        ;;
+      -z | --zone )
+        arg_required "${@}"
+        readonly ZONE="${2}"
+        shift 2
+        ;;
+      -p | --project-id | --project_id)
+        arg_required "${@}"
+        readonly PROJECT_ID="${2}"
+        shift 2
+        ;;
+      -sc | --skip-credentials | --skip_credentials)
+        readonly SKIP_CREDENTIALS=1
+        shift 1
+        ;;
+      -h | --help)
+        usage
+        exit
+        ;;
+      *)
+        COMMANDS+=("${1}")
+        shift
+        ;;
+    esac
+  done
+}
+
+### Main program & invocation ###
+
+kops::main() {
+  kops::parse_args "${@}" # Store arguments and commands in separate vars
+  kops::parse_command "${COMMANDS[*]}" # Process commands with args
+}
+
+kops::main "${@}"
