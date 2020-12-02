@@ -15,19 +15,22 @@ else
 fi
 
 ### Script-wide variables ###
-readonly PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
-readonly WORK_DIR="${WORK_DIR:-"${PWD}/workdir"}"
-readonly BIN_DIR="${WORK_DIR}/bin"
-readonly REMOTE_CLUSTER_NAME_BASE="${GCE_CONTEXT:="onprem"}"
-readonly REMOTE_CLUSTER_NAME="${REMOTE_CLUSTER_NAME_BASE}.k8s.local"
-readonly KOPS_STORE=gs://"${PROJECT_ID}-kops-${REMOTE_CLUSTER_NAME_BASE}"
-readonly REMOTE_KUBECONFIG="${WORK_DIR}/${REMOTE_CLUSTER_NAME_BASE}.context"
-readonly ZONE="${ZONE:-"$(gcloud config get-value compute/zone 2>/dev/null)"}"
-readonly SCRIPT_NAME="${0##*/}"
-SKIP_CREDENTIALS="${SKIP_CREDENTIALS:-"0"}"
+PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
 CURRENT_COMMAND=
-PLATFORM="${WORK_DIR:-"linux"}" # Default platform is Linux, but we'll detect it anyway
 COMMANDS=() # Storage of commands
+
+kops::set_vars() {
+  readonly WORK_DIR="${WORK_DIR:-"${PWD}/workdir"}"
+  readonly BIN_DIR="${WORK_DIR}/bin"
+  readonly REMOTE_CLUSTER_NAME_BASE="${REMOTE_CLUSTER_NAME_BASE:="kops"}"
+  readonly REMOTE_CLUSTER_NAME="${REMOTE_CLUSTER_NAME_BASE}.k8s.local"
+  readonly KOPS_STORE=gs://"${PROJECT_ID}-kops-${REMOTE_CLUSTER_NAME_BASE}"
+  readonly REMOTE_KUBECONFIG="${WORK_DIR}/${REMOTE_CLUSTER_NAME_BASE}.context"
+  readonly ZONE="${ZONE:-"$(gcloud config get-value compute/zone 2>/dev/null)"}"
+  readonly SCRIPT_NAME="${0##*/}"
+  readonly SKIP_CREDENTIALS="${SKIP_CREDENTIALS:-"0"}"
+  PLATFORM="${PLATFORM:-"linux"}" # Default platform is Linux, but we'll detect it anyway
+}
 
 
 ### Convenience functions ###
@@ -79,7 +82,7 @@ kops::main_install() {
 	create_kops_cluster
 	up_check
   authorize_user
-  rename_context "${REMOTE_CLUSTER_NAME}" "${GCE_CONTEXT}"
+  rename_context "${REMOTE_CLUSTER_NAME}" "${REMOTE_CLUSTER_NAME_BASE}"
 }
 
 kops::main_destroy() {
@@ -252,21 +255,21 @@ kops::parse_args() {
     case "${1}" in
       -c | --cluster-name | --cluster_name)
         arg_required "${@}"
-        readonly REMOTE_CLUSTER_NAME="${2}"
+        REMOTE_CLUSTER_NAME_BASE="${2}"
         shift 2
         ;;
       -z | --zone )
         arg_required "${@}"
-        readonly ZONE="${2}"
+        ZONE="${2}"
         shift 2
         ;;
       -p | --project-id | --project_id)
         arg_required "${@}"
-        readonly PROJECT_ID="${2}"
+        PROJECT_ID="${2}"
         shift 2
         ;;
       -sc | --skip-credentials | --skip_credentials)
-        readonly SKIP_CREDENTIALS=1
+        SKIP_CREDENTIALS=1
         shift 1
         ;;
       -h | --help)
@@ -285,6 +288,7 @@ kops::parse_args() {
 
 kops::main() {
   kops::parse_args "${@}" # Store arguments and commands in separate vars
+  kops::set_vars
   kops::parse_command "${COMMANDS[*]}" # Process commands with args
 }
 
